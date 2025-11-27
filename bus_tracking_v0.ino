@@ -1,14 +1,20 @@
 /*******************************************************
-   MERGED LCD + KEYPAD + EEPROM + SIM800 MQTT + GPS
-   Publishes route JSON immediately after saving:
-   Topic: wjp/bus/001/route
-   Payload example: { "route": "123" }
+ LCD + KEYPAD + EEPROM + SIM800 MQTT + GPS
+ 
+ MQTT TOPICS USED:
+ - wjp/bus/{SERIAL}/location          : GPS coordinates (publish every 30s)
+ - wjp/bus/{SERIAL}/route/update      : Route updates (publish on save)
+ - wjp/bus/{SERIAL}/route/req         : Request current route (publish "1" on startup)
+ - wjp/bus/{SERIAL}/route/current     : Receive current route (subscribe)
 ********************************************************/
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <Keypad.h>
 #include <EEPROM.h>
+
+// ---------------- DEVICE SERIAL NUMBER ----------------
+const char* DEVICE_SERIAL = "GPS001"; 
 
 // ---------------- LCD + KEYPAD ----------------
 #define BACKLIGHT_PIN 15
@@ -38,6 +44,7 @@ const char* msg = "";
 // Forward declaration
 void cancelEdit();
 void publishRoute();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
 
 // ---------------- SIM800 + MQTT + GPS -----------------
 #define TINY_GSM_MODEM_SIM800
@@ -72,8 +79,11 @@ const uint16_t mqttPort = 1883;
 const char* mqttUser = nullptr;
 const char* mqttPassword = nullptr;
 
-const char* gpsTopic = "wjp/bus/GPS001";
-const char* routeTopic = "wjp/bus/GPS001/route";
+// Dynamic MQTT Topics based on device serial
+char locationTopic[50];       // wjp/bus/GPS001/location
+char routeUpdateTopic[50];    // wjp/bus/GPS001/route/update
+char routeReqTopic[50];       // wjp/bus/GPS001/route/req
+char routeCurrentTopic[50];   // wjp/bus/GPS001/route/current
 
 String clientId;
 
@@ -85,8 +95,41 @@ unsigned long lastPublish = 0;
 
 // --------------------------------------------------------------
 
+void showCurrentFile(){
+  const char *path = __FILE__;
+  const char *file = strrchr(path, '/');
+  if (!file) file = strrchr(path, '\\'); // Windows path
+  if (file) file++; // Skip separator
+
+  Serial.print("Current file: ");
+  Serial.println(file);
+}
+
+
+
 void setup() {
   Serial.begin(115200);
+
+  showCurrentFile(); // Show the current filename
+
+  // Build dynamic MQTT topics using device serial number
+  snprintf(locationTopic, sizeof(locationTopic), "wjp/bus/%s/location", DEVICE_SERIAL);
+  snprintf(routeUpdateTopic, sizeof(routeUpdateTopic), "wjp/bus/%s/route/update", DEVICE_SERIAL);
+  snprintf(routeReqTopic, sizeof(routeReqTopic), "wjp/bus/%s/route/req", DEVICE_SERIAL);
+  snprintf(routeCurrentTopic, sizeof(routeCurrentTopic), "wjp/bus/%s/route/current", DEVICE_SERIAL);
+
+  Serial.println("=== Device Configuration ===");
+  Serial.print("Serial Number: ");
+  Serial.println(DEVICE_SERIAL);
+  Serial.print("Location Topic: ");
+  Serial.println(locationTopic);
+  Serial.print("Route Update Topic: ");
+  Serial.println(routeUpdateTopic);
+  Serial.print("Route Request Topic: ");
+  Serial.println(routeReqTopic);
+  Serial.print("Route Current Topic: ");
+  Serial.println(routeCurrentTopic);
+  Serial.println("============================");
 
   pinMode(BACKLIGHT_PIN, OUTPUT);
   digitalWrite(BACKLIGHT_PIN, HIGH);
@@ -127,10 +170,16 @@ void setup() {
   // GPRS
   modem.gprsConnect(apn, user, pass);
 
+  // Set MQTT callback before connecting
   mqtt.setServer(mqttServer, mqttPort);
+  mqtt.setCallback(mqttCallback);
 
-  clientId = "esp32-" + String(random(0xffff), HEX);
+  // Use device serial in client ID for uniqueness
+  clientId = "esp32-" + String(DEVICE_SERIAL) + "-" + String(random(0xffff), HEX);
   mqttConnect();
+  
+  // Request current route from server
+  requestCurrentRoute();
 }
 
 void loop() {
@@ -203,7 +252,7 @@ void loop() {
         showMessage("Saved");
 
         // -------------------------------
-        // 🔥 PUBLISH ROUTE JSON HERE
+        // PUBLISH ROUTE JSON HERE
         // -------------------------------
         publishRoute();
 
@@ -242,7 +291,7 @@ void loop() {
     char buf[200];
     size_t n = serializeJson(doc, buf);
 
-    mqtt.publish(gpsTopic, buf, n);
+    mqtt.publish(locationTopic, buf, n);
   }
 
   delay(5);
@@ -253,11 +302,88 @@ void loop() {
 // -------------------------------------------------------------------
 bool mqttConnect() {
   if (!mqtt.connect(clientId.c_str())) return false;
+  
+  // Subscribe to route/current topic
+  mqtt.subscribe(routeCurrentTopic);
+  
+  Serial.println("MQTT Connected!");
+  Serial.print("Client ID: ");
+  Serial.println(clientId);
+  Serial.print("Subscribed to: ");
+  Serial.println(routeCurrentTopic);
+  
   return true;
 }
 
 // -------------------------------------------------------------------
-// 🔥 Publish saved route immediately after saving
+// Request current route from server on startup
+// -------------------------------------------------------------------
+void requestCurrentRoute() {
+  mqtt.publish(routeReqTopic, "1");
+  
+  Serial.print("Requested current route on topic: ");
+  Serial.println(routeReqTopic);
+}
+
+// -------------------------------------------------------------------
+// MQTT Callback - Handle incoming messages
+// -------------------------------------------------------------------
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message received on topic: ");
+  Serial.println(topic);
+  
+  // Check if it's the route/current topic
+  if (strcmp(topic, routeCurrentTopic) == 0) {
+    // Parse JSON payload
+    StaticJsonDocument<100> doc;
+    DeserializationError error = deserializeJson(doc, payload, length);
+    
+    if (error) {
+      Serial.print("JSON parsing failed: ");
+      Serial.println(error.c_str());
+      return;
+    }
+    
+    // Extract route
+    const char* newRoute = doc["route"];
+    
+    if (newRoute && strlen(newRoute) == 3) {
+      // Validate that all characters are digits
+      bool valid = true;
+      for (int i = 0; i < 3; i++) {
+        if (newRoute[i] < '0' || newRoute[i] > '9') {
+          valid = false;
+          break;
+        }
+      }
+      
+      if (valid) {
+        // Update route in memory
+        memcpy(route, newRoute, 3);
+        
+        // Save to EEPROM
+        for (byte i = 0; i < 3; i++) {
+          EEPROM.write(i, route[i]);
+        }
+        EEPROM.commit();
+        
+        // Update display
+        render();
+        showMessage("Route synced");
+        
+        Serial.print("Route updated to: ");
+        Serial.println(newRoute);
+      } else {
+        Serial.println("Invalid route format - must be 3 digits");
+      }
+    } else {
+      Serial.println("Invalid route data");
+    }
+  }
+}
+
+// -------------------------------------------------------------------
+// Publish saved route immediately after saving
 // -------------------------------------------------------------------
 void publishRoute() {
   StaticJsonDocument<100> doc;
@@ -271,7 +397,12 @@ void publishRoute() {
   char out[100];
   size_t len = serializeJson(doc, out);
 
-  mqtt.publish(routeTopic, (uint8_t*)out, len, true); // retained
+  mqtt.publish(routeUpdateTopic, (uint8_t*)out, len, true); // retained
+  
+  Serial.print("Published route to topic: ");
+  Serial.println(routeUpdateTopic);
+  Serial.print("Payload: ");
+  Serial.println(out);
 }
 
 // ---------------- LCD FUNCTIONS ------------------------
