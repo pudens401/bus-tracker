@@ -72,8 +72,8 @@ const uint16_t mqttPort = 1883;
 const char* mqttUser = nullptr;
 const char* mqttPassword = nullptr;
 
-const char* gpsTopic = "wjp/bus/001";
-const char* routeTopic = "wjp/bus/001/route";
+const char* gpsTopic = "wjp/bus/GPS001";
+const char* routeTopic = "wjp/bus/GPS001/route";
 
 String clientId;
 
