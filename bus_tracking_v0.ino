@@ -1,7 +1,7 @@
 /*******************************************************
  LCD + KEYPAD + EEPROM + SIM800 MQTT + GPS
  
- MQTT TOPICS USED:
+ MQTT TOPICS USED :
  - wjp/bus/{SERIAL}/location          : GPS coordinates (publish every 30s)
  - wjp/bus/{SERIAL}/route/update      : Route updates (publish on save)
  - wjp/bus/{SERIAL}/route/req         : Request current route (publish "1" on startup)
